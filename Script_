@@ -1,0 +1,141 @@
+#!/usr/bin/env python
+
+"""Greetings!
+
+Usage:
+  refr.py --env <arg1> --query <arg2>
+  refr.py [-h|--help]
+
+Options:
+  -e,--env <dev|stg|prod|prod1>  The environment to query [default:dev].
+  -q,--query <today_checkouts|get_active_res>  The Query.
+  -h,--help  Show this Screen.
+
+"""
+
+
+from __future__ import print_function
+import sys
+from sqlalchemy import create_engine
+from sqlalchemy.ext.automap import automap_base
+from sqlalchemy.sql import select
+from sqlalchemy import func
+from docopt import docopt
+import requests
+import re
+import codecs
+import arrow
+from apscheduler.schedulers.blocking import BlockingScheduler
+import logging
+import keen
+import os
+
+#logging.basicConfig()
+logging.basicConfig(filename='example.log',level=logging.DEBUG, format='%(asctime)s %(message)s')
+logging.info('is when this script was last run.')
+
+sched = BlockingScheduler()
+
+sys.stdout = codecs.getwriter('utf8')(sys.stdout)
+sys.stderr = codecs.getwriter('utf8')(sys.stderr)
+
+AUTH_TOKEN = '2e914f371e97a2014a08536bdad05b'
+AFFILIATE_ENDPOINT = "http://kcsaffiliate.prod.cryptkeypr.com:8091"
+
+response = requests.get(AFFILIATE_ENDPOINT)
+
+keen.project_id = os.environ["KEEN_PROJECT_ID"]
+keen.write_key = os.environ["KEEN_WRITE_KEY"]
+
+def init_config():
+    conn_map = {}
+    for key in ["DB_USER", "DB_PASSWORD", "DB_HOST", "DB_PORT", "DB_NAME"]:
+        conn_map.update({key: os.environ[key]})
+    connection_string = 'mysql+pymysql://{}:{}@{}:{}/{}'.format(conn_map['DB_USER'],conn_map['DB_PASSWORD'],conn_map['DB_HOST'],conn_map['DB_PORT'],conn_map['DB_NAME'])
+    conn_map.update({"prod1": connection_string})
+    return conn_map
+
+conn_map = init_config()
+
+def get_engine(conn_str):
+# Initialize connection engine
+    engine = create_engine(conn_str)
+    return engine
+
+#Active_reservations
+def get_active_res(engine,reservation):
+    # run query
+    q5 = select([reservation.affiliate_id, func.count(reservation.reservation_status)]).where(reservation.reservation_status == 'INHOUSE').group_by(reservation.affiliate_id)
+    # Get a db connection
+    conn = engine.connect()
+    result = conn.execute(q5)
+    js = []
+    # output results
+    for row in result:
+        for affil in response.json()["data"]:
+            regex = re.sub(r'\W', "", affil["id"])
+            if row[0] == regex:
+                dct = {'Affiliate ID':row[0],'Affiliate name':affil["name"],'Active Reservations':row[1]}
+                js.append(dct)
+    # add to KEEN_IO
+    keen.add_events({"reservations": js})
+
+#Check-ins
+def today_checkins(engine,reservation):
+    utc = arrow.utcnow().format('YYYY-MM-DD')
+    # run query
+    q4 = select([reservation.affiliate_id, func.count(reservation.checkin)]).where(reservation.checkin == utc).group_by(reservation.affiliate_id)
+    # Get a db connection
+    conn = engine.connect()
+    result = conn.execute(q4)
+    js = []
+    # output results
+    for row in result:
+        for affil in response.json()["data"]:
+            regex = re.sub(r'\W', "", affil["id"])
+            if row[0] == regex:
+                dct = {'Affiliate ID':row[0],'Affiliate name':affil["name"],'Check-ins today':row[1]}
+                js.append(dct)
+    #add to KEEN_IO
+    keen.add_events({"check-ins": js})
+
+#Checkouts
+def today_checkouts(engine,reservation):
+    utc = arrow.utcnow().format('YYYY-MM-DD')
+    # run query
+    q6 = select([reservation.affiliate_id, reservation.day_of_checkout, func.count(reservation.day_of_checkout)]).where(reservation.day_of_checkout == utc).group_by(reservation.affiliate_id)
+    # Get a db connection
+    conn = engine.connect()
+    result = conn.execute(q6)
+    js = []
+    # output results
+    for row in result:
+        for affil in response.json()["data"]:
+            regex = re.sub(r'\W', "", affil["id"])
+            if row[0] == regex:
+                dct = {'Affiliate ID':row[0],'Affiliate name':affil["name"],'Day_of_Checkout':row[1],'Checkouts today':row[2]}
+                js.append(dct)
+    #add to KEEN_IO
+    keen.add_events({"checkouts": js})
+
+@sched.scheduled_job('interval', minutes=5)
+def main():
+
+    args = docopt(__doc__)
+    engine = get_engine(conn_map["prod1"])
+    query = args['--query']
+
+    # Auto map existing DB schema to classes
+    Base = automap_base()
+    Base.prepare(engine, reflect=True)
+
+    # Select the reservation table for querying
+    reservation = Base.classes.reservation
+
+    #Call to the queries
+
+    get_active_res(engine, reservation)
+    today_checkins(engine,reservation)
+    today_checkouts(engine, reservation)
+
+sched.start()
