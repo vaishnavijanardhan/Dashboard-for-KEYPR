@@ -133,7 +133,6 @@ def main():
     reservation = Base.classes.reservation
 
     #Call to the queries
-
     get_active_res(engine, reservation)
     today_checkins(engine,reservation)
     today_checkouts(engine, reservation)
